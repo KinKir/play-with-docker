@@ -1,7 +1,7 @@
 (function() {
   'use strict';
 
-  var app = angular.module('DockerPlay', ['ngMaterial']);
+  var app = angular.module('DockerPlay', ['ngMaterial', 'ngFileUpload', 'ngclipboard']);
 
   // Automatically redirects user to a new session when bypassing captcha.
   // Controller keeps code/logic separate from the HTML
@@ -19,24 +19,57 @@
     }
   }
 
-  app.controller('PlayController', ['$scope', '$log', '$http', '$location', '$timeout', '$mdDialog', '$window', 'TerminalService', 'KeyboardShortcutService', 'InstanceService', 'SessionService', function($scope, $log, $http, $location, $timeout, $mdDialog, $window, TerminalService, KeyboardShortcutService, InstanceService, SessionService) {
+  app.controller('PlayController', ['$scope', '$log', '$http', '$location', '$timeout', '$mdDialog', '$window', 'TerminalService', 'KeyboardShortcutService', 'InstanceService', 'SessionService', 'Upload', function($scope, $log, $http, $location, $timeout, $mdDialog, $window, TerminalService, KeyboardShortcutService, InstanceService, SessionService, Upload) {
     $scope.sessionId = SessionService.getCurrentSessionId();
     $scope.instances = [];
     $scope.idx = {};
+    $scope.host = window.location.host;
+    $scope.idxByHostname = {};
     $scope.selectedInstance = null;
     $scope.isAlive = true;
     $scope.ttl = '--:--:--';
-    $scope.connected = true;
+    $scope.connected = false;
+    $scope.type = {windows: false};
     $scope.isInstanceBeingCreated = false;
     $scope.newInstanceBtnText = '+ Add new instance';
     $scope.deleteInstanceBtnText = 'Delete';
     $scope.isInstanceBeingDeleted = false;
+    $scope.uploadProgress = 0;
+
+    $scope.uploadFiles = function (files, invalidFiles) {
+        let total = files.length;
+        let uploadFile = function() {
+          let file = files.shift();
+          if (!file){
+            $scope.uploadMessage = "";
+            $scope.uploadProgress = 0;
+            return
+          }
+          $scope.uploadMessage = "Uploading file(s) " + (total - files.length) + "/"+ total + " : " + file.name;
+          let upload = Upload.upload({url: '/sessions/' + $scope.sessionId + '/instances/' + $scope.selectedInstance.name + '/uploads', data: {file: file}, method: 'POST'})
+            .then(function(){}, function(){}, function(evt) {
+              $scope.uploadProgress = parseInt(100.0 * evt.loaded / evt.total);
+            });
+
+          // process next file
+          upload.finally(uploadFile);
+        }
+
+        uploadFile();
+    }
 
     var selectedKeyboardShortcuts = KeyboardShortcutService.getCurrentShortcuts();
 
+    $scope.resizeHandler = null;
+
     angular.element($window).bind('resize', function() {
       if ($scope.selectedInstance) {
-        $scope.resize($scope.selectedInstance.term.proposeGeometry());
+        if (!$scope.resizeHandler) {
+            $scope.resizeHandler = setTimeout(function() {
+                $scope.resizeHandler = null
+                $scope.resize($scope.selectedInstance.term.proposeGeometry());
+            }, 1000);
+        }
       }
     });
 
@@ -45,7 +78,7 @@
     });
 
 
-    $scope.showAlert = function(title, content, parent) {
+    $scope.showAlert = function(title, content, parent, cb) {
       $mdDialog.show(
         $mdDialog.alert()
         .parent(angular.element(document.querySelector(parent || '#popupContainer')))
@@ -53,11 +86,15 @@
         .title(title)
         .textContent(content)
         .ok('Got it!')
-      );
+      ).finally(function() {
+        if (cb) {
+           cb();
+        }
+      });
     }
 
     $scope.resize = function(geometry) {
-      $scope.socket.emit('viewport resize', geometry.cols, geometry.rows);
+      $scope.socket.emit('instance viewport resize', geometry.cols, geometry.rows);
     }
 
     KeyboardShortcutService.setResizeFunc($scope.resize);
@@ -74,9 +111,11 @@
         $scope.instances.push(i);
         i.buffer = '';
         $scope.idx[i.name] = i;
+        $scope.idxByHostname[i.hostname] = i;
       } else {
         $scope.idx[i.name].ip = i.ip;
         $scope.idx[i.name].hostname = i.hostname;
+        $scope.idx[i.name].proxy_host = i.proxy_host;
       }
 
       return $scope.idx[i.name];
@@ -84,16 +123,18 @@
 
     $scope.newInstance = function() {
       updateNewInstanceBtnState(true);
+      var instanceType = $scope.type.windows ? 'windows': 'linux';
       $http({
         method: 'POST',
         url: '/sessions/' + $scope.sessionId + '/instances',
-        data : { ImageName : InstanceService.getDesiredImage() }
+        data : { ImageName : InstanceService.getDesiredImage(), type: instanceType }
       }).then(function(response) {
-        var i = $scope.upsertInstance(response.data);
-        $scope.showInstance(i);
+        $scope.upsertInstance(response.data);
       }, function(response) {
         if (response.status == 409) {
           $scope.showAlert('Max instances reached', 'Maximum number of instances reached')
+        } else if (response.status == 503 && response.data.error == 'out_of_capacity') {
+          $scope.showAlert('Out Of Capacity', 'We are really sorry. But we are currently out of capacity and cannot create new instances. Please try again later.')
         }
       }).finally(function() {
         updateNewInstanceBtnState(false);
@@ -105,7 +146,7 @@
 
       if (!state) {
         $mdDialog.show({
-          controller: SessionBuilderModalController,
+          onComplete: function(){SessionBuilderModalController($mdDialog, $scope)},
           contentElement: '#builderDialog',
           parent: angular.element(document.body),
           clickOutsideToClose: false,
@@ -115,6 +156,15 @@
       }
     }
 
+    $scope.loadPlaygroundConf = function() {
+      $http({
+        method: 'GET',
+        url: '/my/playground',
+      }).then(function(response) {
+        $scope.playground = response.data;
+      });
+
+    }
     $scope.getSession = function(sessionId) {
       $http({
         method: 'GET',
@@ -129,7 +179,81 @@
             $scope.$apply();
           }, 1000);
         }
-        var socket = io({ path: '/sessions/' + sessionId + '/ws' });
+
+        var i = response.data;
+        for (var k in i.instances) {
+          var instance = i.instances[k];
+          $scope.instances.push(instance);
+          $scope.idx[instance.name] = instance;
+          $scope.idxByHostname[instance.hostname] = instance;
+        }
+
+	var base = '';
+	if (window.location.protocol == 'http:') {
+		base = 'ws://';
+	} else {
+		base = 'wss://';
+	}
+	base += window.location.host;
+	if (window.location.port) {
+		base += ':' + window.location.port;
+	}
+
+	var socket = new ReconnectingWebSocket(base + '/sessions/' + sessionId + '/ws/', null, {reconnectInterval: 1000});
+	socket.listeners = {};
+
+	socket.on = function(name, cb) {
+		if (!socket.listeners[name]) {
+			socket.listeners[name] = [];
+		}
+		socket.listeners[name].push(cb);
+	}
+
+	socket.emit = function() {
+		var name = arguments[0]
+		var args = [];
+		for (var i = 1; i < arguments.length; i++) {
+			args.push(arguments[i]);
+		}
+		socket.send(JSON.stringify({name: name, args: args}));
+	}
+
+	socket.addEventListener('open', function (event) {
+          $scope.connected = true;
+	  for (var i in $scope.instances) {
+		  var instance = $scope.instances[i];
+		  if (instance.term) {
+			  instance.term.setOption('disableStdin', false);
+		  }
+	  }
+	});
+	socket.addEventListener('close', function (event) {
+          $scope.connected = false;
+	  for (var i in $scope.instances) {
+		  var instance = $scope.instances[i];
+		  if (instance.term) {
+			  instance.term.setOption('disableStdin', true);
+		  }
+	  }
+	});
+	socket.addEventListener('message', function (event) {
+		var m = JSON.parse(event.data);
+		var ls = socket.listeners[m.name];
+		if (ls) {
+			for (var i=0; i<ls.length; i++) {
+				var l = ls[i];
+				l.apply(l, m.args);
+			}
+		}
+	});
+
+
+        socket.on('instance terminal status', function(name, status) {
+            var instance = $scope.idx[name];
+            if (instance) {
+                instance.status = status;
+            }
+        });
 
         socket.on('session ready', function(ready) {
           $scope.setSessionState(ready);
@@ -139,8 +263,11 @@
           $scope.builderTerminal.write(data);
         });
 
-        socket.on('terminal out', function(name, data) {
+        socket.on('instance terminal out', function(name, data) {
           var instance = $scope.idx[name];
+          if (!instance) {
+            return;
+          }
 
           if (!instance) {
             // instance is new and was created from another client, we should add it
@@ -155,62 +282,107 @@
         });
 
         socket.on('session end', function() {
-          $scope.showAlert('Session timed out!', 'Your session has expired and all of your instances have been deleted.', '#sessionEnd')
+          $scope.showAlert('Session timed out!', 'Your session has expired and all of your instances have been deleted.', '#sessionEnd', function() {
+            window.location.href = '/';
+          });
           $scope.isAlive = false;
+          socket.close();
         });
 
-        socket.on('viewport', function(rows, cols) {
-        });
-
-        socket.on('new instance', function(name, ip, hostname) {
-          $scope.upsertInstance({ name: name, ip: ip, hostname: hostname });
+        socket.on('instance new', function(name, ip, hostname, proxyHost) {
+          var instance = $scope.upsertInstance({ name: name, ip: ip, hostname: hostname, proxy_host: proxyHost});
           $scope.$apply(function() {
-            if ($scope.instances.length == 1) {
-              $scope.showInstance($scope.instances[0]);
-            }
+            $scope.showInstance(instance);
           });
         });
 
-        socket.on('delete instance', function(name) {
+        socket.on('instance delete', function(name) {
           $scope.removeInstance(name);
           $scope.$apply();
         });
 
-        socket.on('viewport resize', function(cols, rows) {
+        socket.on('instance viewport resize', function(cols, rows) {
+            if (cols == 0 || rows == 0) {
+                return
+            }
           // viewport has changed, we need to resize all terminals
-
           $scope.instances.forEach(function(instance) {
-            instance.term.resize(cols, rows);
+              if (instance.term) {
+                instance.term.resize(cols, rows);
+                if (instance.buffer) {
+                  instance.term.write(instance.buffer);
+                  instance.buffer = '';
+                }
+              }
           });
         });
 
-        socket.on('connect_error', function() {
-          $scope.connected = false;
-        });
-        socket.on('connect', function() {
-          $scope.connected = true;
+        socket.on('instance stats', function(stats) {
+          if (! $scope.idx[stats.instance]) {
+              return
+          }
+          $scope.idx[stats.instance].mem = stats.mem;
+          $scope.idx[stats.instance].cpu = stats.cpu;
+          $scope.$apply();
         });
 
-        socket.on('instance stats', function(name, mem, cpu, isManager, ports) {
-          $scope.idx[name].mem = mem;
-          $scope.idx[name].cpu = cpu;
-          $scope.idx[name].isManager = isManager;
-          $scope.idx[name].ports = ports;
+        socket.on('instance docker swarm status', function(status) {
+            if (!$scope.idx[status.instance]) {
+                return
+            }
+            if (status.is_manager) {
+                $scope.idx[status.instance].isManager = true
+            } else if (status.is_worker) {
+                $scope.idx[status.instance].isManager = false
+            } else {
+                $scope.idx[status.instance].isManager = null
+            }
+            $scope.$apply();
+        });
+
+        socket.on('instance k8s status', function(status) {
+            if (!$scope.idx[status.instance]) {
+                return
+            }
+            if (status.is_manager) {
+                $scope.idx[status.instance].isK8sManager = true
+            } else if (status.is_worker) {
+                $scope.idx[status.instance].isK8sManager = false
+            } else {
+                $scope.idx[status.instance].isK8sManager = null
+            }
+            $scope.$apply();
+        });
+
+        socket.on('instance docker ports', function(status) {
+          if (!$scope.idx[status.instance]) {
+              return
+          }
+          $scope.idx[status.instance].ports = status.ports;
           $scope.$apply();
+        });
+
+        socket.on('instance docker swarm ports', function(status) {
+            for(var i in status.instances) {
+                var instance = status.instances[i];
+                if ($scope.idxByHostname[instance]) {
+                    $scope.idxByHostname[instance].swarmPorts = status.ports;
+                }
+            }
+            $scope.$apply();
         });
 
         $scope.socket = socket;
 
-        var i = response.data;
-        for (var k in i.instances) {
-          var instance = i.instances[k];
-          $scope.instances.push(instance);
-          $scope.idx[instance.name] = instance;
-        }
 
         // If instance is passed in URL, select it
         let inst = $scope.idx[$location.hash()];
-        if (inst) $scope.showInstance(inst);
+        if (inst) {
+            $scope.showInstance(inst);
+        } else if($scope.instances.length > 0) {
+            // if no instance has been passed, select the first.
+            $scope.showInstance($scope.instances[0]);
+        }
       }, function(response) {
         if (response.status == 404) {
           document.write('session not found');
@@ -220,7 +392,7 @@
     }
 
     $scope.getProxyUrl = function(instance, port) {
-      var url = window.location.protocol + '//pwd' + instance.ip.replace(/\./g, '-') + '-' + port + '.' + window.location.host;
+      var url = 'http://' + instance.proxy_host + '-' + port + '.direct.' + $scope.host;
 
       return url;
     }
@@ -228,22 +400,23 @@
     $scope.showInstance = function(instance) {
       $scope.selectedInstance = instance;
       $location.hash(instance.name);
-      if (!instance.creatingTerminal) {
-        if (!instance.term) {
+      if (!instance.term) {
           $timeout(function() {
-            createTerminal(instance);
-            TerminalService.setFontSize(TerminalService.getFontSize());
-            instance.term.focus();
+              createTerminal(instance);
+              TerminalService.setFontSize(TerminalService.getFontSize());
+              instance.term.focus();
+              $timeout(function() {
+              }, 0, false);
           }, 0, false);
-          return
-        }
+        return
       }
-      $timeout(function() {
-        instance.term.focus();
-      }, 0, false);
     }
 
     $scope.removeInstance = function(name) {
+        if ($scope.idx[name]) {
+            var handler = $scope.idx[name].terminalBufferInterval;
+            clearInterval(handler);
+        }
       if ($scope.idx[name]) {
         delete $scope.idx[name];
         $scope.instances = $scope.instances.filter(function(i) {
@@ -269,15 +442,11 @@
       });
     }
 
+    $scope.loadPlaygroundConf();
     $scope.getSession($scope.sessionId);
 
     $scope.createBuilderTerminal = function() {
       var builderTerminalContainer = document.getElementById('builder-terminal');
-      // For some reason the dialog DOM might not be ready, so we just keep trying
-      if (!builderTerminalContainer) {
-        setTimeout($scope.createBuilderTerminal, 100);
-        return;
-      }
       let term = new Terminal({
         cursorBlink: false
       });
@@ -318,20 +487,25 @@
       term.open(terminalContainer);
 
       // Set geometry during the next tick, to avoid race conditions.
+
+        /*
       setTimeout(function() {
         $scope.resize(term.proposeGeometry());
       }, 4);
+      */
 
+      instance.terminalBuffer = '';
+      instance.terminalBufferInterval = setInterval(function() {
+          if (instance.terminalBuffer.length > 0) {
+              $scope.socket.emit('instance terminal in', instance.name, instance.terminalBuffer);
+              instance.terminalBuffer = '';
+          }
+      }, 70);
       term.on('data', function(d) {
-        $scope.socket.emit('terminal in', instance.name, d);
+          instance.terminalBuffer += d;
       });
 
       instance.term = term;
-
-      if (instance.buffer) {
-        term.write(instance.buffer);
-        instance.buffer = '';
-      }
 
       if (cb) {
         cb();
@@ -358,9 +532,12 @@
       }
     }
   }])
-  .config(['$mdIconProvider', '$locationProvider', function($mdIconProvider, $locationProvider) {
+  .config(['$mdIconProvider', '$locationProvider', '$mdThemingProvider', function($mdIconProvider, $locationProvider, $mdThemingProvider) {
     $locationProvider.html5Mode({enabled: true, requireBase: false});
     $mdIconProvider.defaultIconSet('../assets/social-icons.svg', 24);
+    $mdThemingProvider.theme('kube')
+      .primaryPalette('grey')
+      .accentPalette('grey');
   }])
   .component('settingsIcon', {
     template : "<md-button class='md-mini' ng-click='$ctrl.onClick()'><md-icon class='material-icons'>settings</md-icon></md-button>",

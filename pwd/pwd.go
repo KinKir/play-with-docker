@@ -1,10 +1,16 @@
 package pwd
 
 import (
+	"context"
+	"errors"
 	"io"
+	"net"
 	"time"
 
 	"github.com/play-with-docker/play-with-docker/docker"
+	"github.com/play-with-docker/play-with-docker/event"
+	"github.com/play-with-docker/play-with-docker/id"
+	"github.com/play-with-docker/play-with-docker/provisioner"
 	"github.com/play-with-docker/play-with-docker/pwd/types"
 	"github.com/play-with-docker/play-with-docker/storage"
 	"github.com/prometheus/client_golang/prometheus"
@@ -43,41 +49,70 @@ func init() {
 }
 
 type pwd struct {
-	docker    docker.DockerApi
-	tasks     SchedulerApi
-	broadcast BroadcastApi
-	storage   storage.StorageApi
+	dockerFactory              docker.FactoryApi
+	event                      event.EventApi
+	storage                    storage.StorageApi
+	generator                  id.Generator
+	clientCount                int32
+	sessionProvisioner         provisioner.SessionProvisionerApi
+	instanceProvisionerFactory provisioner.InstanceProvisionerFactoryApi
+	windowsProvisioner         provisioner.InstanceProvisionerApi
+	dindProvisioner            provisioner.InstanceProvisionerApi
+}
+
+var sessionComplete = errors.New("Session is complete")
+
+func SessionComplete(e error) bool {
+	return e == sessionComplete
+}
+
+var sessionNotEmpty = errors.New("Session is not empty")
+
+func SessionNotEmpty(e error) bool {
+	return e == sessionNotEmpty
 }
 
 type PWDApi interface {
-	SessionNew(duration time.Duration, stack string, stackName, imageName string) (*types.Session, error)
+	SessionNew(ctx context.Context, config types.SessionConfig) (*types.Session, error)
 	SessionClose(session *types.Session) error
-	SessionGetSmallestViewPort(session *types.Session) types.ViewPort
+	SessionGetSmallestViewPort(sessionId string) types.ViewPort
 	SessionDeployStack(session *types.Session) error
-	SessionGet(id string) *types.Session
+	SessionGet(id string) (*types.Session, error)
 	SessionSetup(session *types.Session, conf SessionSetupConf) error
 
-	InstanceNew(session *types.Session, conf InstanceConfig) (*types.Instance, error)
+	InstanceNew(session *types.Session, conf types.InstanceConfig) (*types.Instance, error)
 	InstanceResizeTerminal(instance *types.Instance, cols, rows uint) error
-	InstanceAttachTerminal(instance *types.Instance) error
-	InstanceUploadFromUrl(instance *types.Instance, url string) error
-	InstanceUploadFromReader(instance *types.Instance, filename string, reader io.Reader) error
+	InstanceGetTerminal(instance *types.Instance) (net.Conn, error)
+	InstanceUploadFromUrl(instance *types.Instance, fileName, dest, url string) error
+	InstanceUploadFromReader(instance *types.Instance, fileName, dest string, reader io.Reader) error
 	InstanceGet(session *types.Session, name string) *types.Instance
-	InstanceFindByIP(ip string) *types.Instance
-	InstanceFindByAlias(sessionPrefix, alias string) *types.Instance
-	InstanceFindByIPAndSession(sessionPrefix, ip string) *types.Instance
+	InstanceFindBySession(session *types.Session) ([]*types.Instance, error)
 	InstanceDelete(session *types.Session, instance *types.Instance) error
-	InstanceWriteToTerminal(instance *types.Instance, data string)
-	InstanceAllowedImages() []string
 	InstanceExec(instance *types.Instance, cmd []string) (int, error)
 
 	ClientNew(id string, session *types.Session) *types.Client
 	ClientResizeViewPort(client *types.Client, cols, rows uint)
 	ClientClose(client *types.Client)
+	ClientCount() int
+
+	UserNewLoginRequest(providerName string) (*types.LoginRequest, error)
+	UserGetLoginRequest(id string) (*types.LoginRequest, error)
+	UserLogin(loginRequest *types.LoginRequest, user *types.User) (*types.User, error)
+	UserGet(id string) (*types.User, error)
+
+	PlaygroundNew(playground types.Playground) (*types.Playground, error)
+	PlaygroundGet(id string) *types.Playground
+	PlaygroundFindByDomain(domain string) *types.Playground
+	PlaygroundList() ([]*types.Playground, error)
 }
 
-func NewPWD(d docker.DockerApi, t SchedulerApi, b BroadcastApi, s storage.StorageApi) *pwd {
-	return &pwd{docker: d, tasks: t, broadcast: b, storage: s}
+func NewPWD(f docker.FactoryApi, e event.EventApi, s storage.StorageApi, sp provisioner.SessionProvisionerApi, ipf provisioner.InstanceProvisionerFactoryApi) *pwd {
+	//  windowsProvisioner: provisioner.NewWindowsASG(f, s), dindProvisioner: provisioner.NewDinD(f)
+	return &pwd{dockerFactory: f, event: e, storage: s, generator: id.XIDGenerator{}, sessionProvisioner: sp, instanceProvisionerFactory: ipf}
+}
+
+func (p *pwd) getProvisioner(t string) (provisioner.InstanceProvisionerApi, error) {
+	return p.instanceProvisionerFactory.GetProvisioner(t)
 }
 
 func (p *pwd) setGauges() {
@@ -85,7 +120,7 @@ func (p *pwd) setGauges() {
 	ses := float64(s)
 	i, _ := p.storage.InstanceCount()
 	ins := float64(i)
-	c, _ := p.storage.ClientCount()
+	c := p.ClientCount()
 	cli := float64(c)
 
 	clientsGauge.Set(cli)

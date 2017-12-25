@@ -1,70 +1,73 @@
 package pwd
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math"
 	"path"
-	"strings"
+	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/play-with-docker/play-with-docker/config"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/play-with-docker/play-with-docker/docker"
+	"github.com/play-with-docker/play-with-docker/event"
 	"github.com/play-with-docker/play-with-docker/pwd/types"
-	"github.com/twinj/uuid"
 )
+
+var preparedSessions = map[string]bool{}
 
 type sessionBuilderWriter struct {
 	sessionId string
-	broadcast BroadcastApi
+	event     event.EventApi
 }
 
 func (s *sessionBuilderWriter) Write(p []byte) (n int, err error) {
-	s.broadcast.BroadcastTo(s.sessionId, "session builder out", string(p))
+	s.event.Emit(event.SESSION_BUILDER_OUT, s.sessionId, string(p))
 	return len(p), nil
 }
 
 type SessionSetupConf struct {
-	Instances []SessionSetupInstanceConf `json:"instances"`
+	Instances      []SessionSetupInstanceConf `json:"instances"`
+	PlaygroundFQDN string
 }
 
 type SessionSetupInstanceConf struct {
-	Image          string `json:"image"`
-	Hostname       string `json:"hostname"`
-	IsSwarmManager bool   `json:"is_swarm_manager"`
-	IsSwarmWorker  bool   `json:"is_swarm_worker"`
+	Image          string     `json:"image"`
+	Hostname       string     `json:"hostname"`
+	IsSwarmManager bool       `json:"is_swarm_manager"`
+	IsSwarmWorker  bool       `json:"is_swarm_worker"`
+	Type           string     `json:"type"`
+	Run            [][]string `json:"run"`
+	Tls            bool       `json:"tls"`
 }
 
-func (p *pwd) SessionNew(duration time.Duration, stack, stackName, imageName string) (*types.Session, error) {
+func (p *pwd) SessionNew(ctx context.Context, config types.SessionConfig) (*types.Session, error) {
 	defer observeAction("SessionNew", time.Now())
 
 	s := &types.Session{}
-	s.Id = uuid.NewV4().String()
-	s.Instances = map[string]*types.Instance{}
+	s.Id = p.generator.NewId()
 	s.CreatedAt = time.Now()
-	s.ExpiresAt = s.CreatedAt.Add(duration)
+	s.ExpiresAt = s.CreatedAt.Add(config.Duration)
 	s.Ready = true
-	s.Stack = stack
+	s.Stack = config.Stack
+	s.UserId = config.UserId
+	s.PlaygroundId = config.Playground.Id
 
 	if s.Stack != "" {
 		s.Ready = false
 	}
+	stackName := config.StackName
 	if stackName == "" {
 		stackName = "pwd"
 	}
 	s.StackName = stackName
-	s.ImageName = imageName
+	s.ImageName = config.ImageName
 
 	log.Printf("NewSession id=[%s]\n", s.Id)
-
-	if err := p.docker.CreateNetwork(s.Id); err != nil {
-		log.Println("ERROR NETWORKING")
-		return nil, err
-	}
-	log.Printf("Network [%s] created for session [%s]\n", s.Id, s.Id)
-
-	if err := p.prepareSession(s); err != nil {
+	if err := p.sessionProvisioner.SessionNew(ctx, s); err != nil {
 		log.Println(err)
 		return nil, err
 	}
@@ -75,6 +78,7 @@ func (p *pwd) SessionNew(duration time.Duration, stack, stackName, imageName str
 	}
 
 	p.setGauges()
+	p.event.Emit(event.SESSION_NEW, s.Id)
 
 	return s, nil
 }
@@ -82,56 +86,70 @@ func (p *pwd) SessionNew(duration time.Duration, stack, stackName, imageName str
 func (p *pwd) SessionClose(s *types.Session) error {
 	defer observeAction("SessionClose", time.Now())
 
-	s.Lock()
-	defer s.Unlock()
-
-	s.StopTicker()
-
-	p.broadcast.BroadcastTo(s.Id, "session end")
-	p.broadcast.BroadcastTo(s.Id, "disconnect")
 	log.Printf("Starting clean up of session [%s]\n", s.Id)
-	for _, i := range s.Instances {
-		err := p.InstanceDelete(s, i)
-		if err != nil {
-			log.Println(err)
-			return err
-		}
+	g, _ := errgroup.WithContext(context.Background())
+	instances, err := p.storage.InstanceFindBySessionId(s.Id)
+	if err != nil {
+		log.Printf("Could not find instances in session %s. Got %v\n", s.Id, err)
+		return err
 	}
-	// Disconnect PWD daemon from the network
-	if err := p.docker.DisconnectNetwork(config.PWDContainerName, s.Id); err != nil {
-		if !strings.Contains(err.Error(), "is not connected to the network") {
-			log.Println("ERROR NETWORKING")
-			return err
-		}
+	for _, i := range instances {
+		i := i
+		g.Go(func() error {
+			return p.InstanceDelete(s, i)
+		})
 	}
-	log.Printf("Disconnected pwd from network [%s]\n", s.Id)
-	if err := p.docker.DeleteNetwork(s.Id); err != nil {
-		if !strings.Contains(err.Error(), "not found") {
-			log.Println(err)
-			return err
-		}
+	err = g.Wait()
+	if err != nil {
+		log.Println(err)
+		return err
 	}
 
-	err := p.storage.SessionDelete(s.Id)
+	if err := p.sessionProvisioner.SessionClose(s); err != nil {
+		log.Println(err)
+		return err
+	}
+
+	err = p.storage.SessionDelete(s.Id)
 	if err != nil {
 		return err
 	}
 
 	log.Printf("Cleaned up session [%s]\n", s.Id)
 	p.setGauges()
+	p.event.Emit(event.SESSION_END, s.Id)
 	return nil
 
 }
 
-func (p *pwd) SessionGetSmallestViewPort(s *types.Session) types.ViewPort {
+func (p *pwd) SessionGetSmallestViewPort(sessionId string) types.ViewPort {
 	defer observeAction("SessionGetSmallestViewPort", time.Now())
 
-	minRows := s.Clients[0].ViewPort.Rows
-	minCols := s.Clients[0].ViewPort.Cols
+	clients, err := p.storage.ClientFindBySessionId(sessionId)
+	if err != nil {
+		log.Printf("Error finding clients for session [%s]. Got: %v\n", sessionId, err)
+		return types.ViewPort{Rows: 24, Cols: 80}
+	}
+	if len(clients) == 0 {
+		log.Printf("Session [%s] doesn't have clients. Returning default viewport\n", sessionId)
+		return types.ViewPort{Rows: 24, Cols: 80}
+	}
+	var minRows uint
+	var minCols uint
 
-	for _, c := range s.Clients {
-		minRows = uint(math.Min(float64(minRows), float64(c.ViewPort.Rows)))
-		minCols = uint(math.Min(float64(minCols), float64(c.ViewPort.Cols)))
+	for _, c := range clients {
+		if c.ViewPort.Rows > 0 && c.ViewPort.Cols > 0 {
+			minRows = uint(c.ViewPort.Rows)
+			minCols = uint(c.ViewPort.Cols)
+			break
+		}
+	}
+
+	for _, c := range clients {
+		if c.ViewPort.Rows > 0 && c.ViewPort.Cols > 0 {
+			minRows = uint(math.Min(float64(minRows), float64(c.ViewPort.Rows)))
+			minCols = uint(math.Min(float64(minCols), float64(c.ViewPort.Cols)))
+		}
 	}
 
 	return types.ViewPort{Rows: minRows, Cols: minCols}
@@ -146,24 +164,33 @@ func (p *pwd) SessionDeployStack(s *types.Session) error {
 	}
 
 	s.Ready = false
-	p.broadcast.BroadcastTo(s.Id, "session ready", false)
-	i, err := p.InstanceNew(s, InstanceConfig{ImageName: s.ImageName, Host: s.Host})
+	p.event.Emit(event.SESSION_READY, s.Id, false)
+	i, err := p.InstanceNew(s, types.InstanceConfig{ImageName: s.ImageName, PlaygroundFQDN: s.Host})
 	if err != nil {
 		log.Printf("Error creating instance for stack [%s]: %s\n", s.Stack, err)
 		return err
 	}
-	err = p.InstanceUploadFromUrl(i, s.Stack)
+
+	_, fileName := filepath.Split(s.Stack)
+	err = p.InstanceUploadFromUrl(i, fileName, "/var/run/pwd/uploads", s.Stack)
 	if err != nil {
 		log.Printf("Error uploading stack file [%s]: %s\n", s.Stack, err)
 		return err
 	}
 
-	fileName := path.Base(s.Stack)
+	fileName = path.Base(s.Stack)
 	file := fmt.Sprintf("/var/run/pwd/uploads/%s", fileName)
 	cmd := fmt.Sprintf("docker swarm init --advertise-addr eth0 && docker-compose -f %s pull && docker stack deploy -c %s %s", file, file, s.StackName)
 
-	w := sessionBuilderWriter{sessionId: s.Id, broadcast: p.broadcast}
-	code, err := p.docker.ExecAttach(i.Name, []string{"sh", "-c", cmd}, &w)
+	w := sessionBuilderWriter{sessionId: s.Id, event: p.event}
+
+	dockerClient, err := p.dockerFactory.GetForSession(s)
+	if err != nil {
+		log.Println(err)
+		return err
+	}
+
+	code, err := dockerClient.ExecAttach(i.Name, []string{"sh", "-c", cmd}, &w)
 	if err != nil {
 		log.Printf("Error executing stack [%s]: %s\n", s.Stack, err)
 		return err
@@ -171,160 +198,115 @@ func (p *pwd) SessionDeployStack(s *types.Session) error {
 
 	log.Printf("Stack execution finished with code %d\n", code)
 	s.Ready = true
-	p.broadcast.BroadcastTo(s.Id, "session ready", true)
+	p.event.Emit(event.SESSION_READY, s.Id, true)
 	if err := p.storage.SessionPut(s); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (p *pwd) SessionGet(sessionId string) *types.Session {
+func (p *pwd) SessionGet(sessionId string) (*types.Session, error) {
 	defer observeAction("SessionGet", time.Now())
 
-	s, _ := p.storage.SessionGet(sessionId)
+	s, err := p.storage.SessionGet(sessionId)
 
-	if err := p.prepareSession(s); err != nil {
+	if err != nil {
 		log.Println(err)
-		return nil
+		return nil, err
 	}
-	return s
+
+	return s, nil
 }
 
-func (p *pwd) SessionSetup(session *types.Session, conf SessionSetupConf) error {
+func (p *pwd) SessionSetup(session *types.Session, sconf SessionSetupConf) error {
 	defer observeAction("SessionSetup", time.Now())
+
+	c := sync.NewCond(&sync.Mutex{})
+
 	var tokens *docker.SwarmTokens = nil
 	var firstSwarmManager *types.Instance = nil
 
-	// first look for a swarm manager and create it
-	for _, conf := range conf.Instances {
-		if conf.IsSwarmManager {
-			instanceConf := InstanceConfig{
-				ImageName: conf.Image,
-				Hostname:  conf.Hostname,
-				Host:      session.Host,
+	instances, err := p.storage.InstanceFindBySessionId(session.Id)
+	if err != nil {
+		log.Println(err)
+		return err
+	}
+	if len(instances) > 0 {
+		return sessionNotEmpty
+	}
+
+	g, _ := errgroup.WithContext(context.Background())
+
+	for _, conf := range sconf.Instances {
+		conf := conf
+		g.Go(func() error {
+			instanceConf := types.InstanceConfig{
+				ImageName:      conf.Image,
+				Hostname:       conf.Hostname,
+				PlaygroundFQDN: sconf.PlaygroundFQDN,
+				Type:           conf.Type,
+				Tls:            conf.Tls,
 			}
 			i, err := p.InstanceNew(session, instanceConf)
 			if err != nil {
 				return err
 			}
-			if i.Docker == nil {
-				dock, err := p.docker.New(i.IP, i.Cert, i.Key)
+
+			if conf.IsSwarmManager || conf.IsSwarmWorker {
+				dockerClient, err := p.dockerFactory.GetForInstance(i)
 				if err != nil {
 					return err
 				}
-				i.Docker = dock
-			}
-			tkns, err := i.Docker.SwarmInit()
-			if err != nil {
-				return err
-			}
-			tokens = tkns
-			firstSwarmManager = i
-			break
-		}
-	}
-
-	// now create the rest in parallel
-
-	wg := sync.WaitGroup{}
-	for _, c := range conf.Instances {
-		if firstSwarmManager != nil && c.Hostname != firstSwarmManager.Hostname {
-			wg.Add(1)
-			go func(c SessionSetupInstanceConf) {
-				defer wg.Done()
-				instanceConf := InstanceConfig{
-					ImageName: c.Image,
-					Hostname:  c.Hostname,
+				if conf.IsSwarmManager {
+					c.L.Lock()
+					if firstSwarmManager == nil {
+						tkns, err := dockerClient.SwarmInit(i.IP)
+						if err != nil {
+							log.Printf("Cannot initialize swarm on instance %s. Got: %v\n", i.Name, err)
+							return err
+						}
+						tokens = tkns
+						firstSwarmManager = i
+						c.Broadcast()
+						c.L.Unlock()
+					} else {
+						c.L.Unlock()
+						if err := dockerClient.SwarmJoin(fmt.Sprintf("%s:2377", firstSwarmManager.IP), tokens.Manager); err != nil {
+							log.Printf("Cannot join manager %s to swarm. Got: %v\n", i.Name, err)
+							return err
+						}
+					}
+				} else if conf.IsSwarmWorker {
+					c.L.Lock()
+					if firstSwarmManager == nil {
+						c.Wait()
+					}
+					c.L.Unlock()
+					err = dockerClient.SwarmJoin(fmt.Sprintf("%s:2377", firstSwarmManager.IP), tokens.Worker)
+					if err != nil {
+						log.Printf("Cannot join worker %s to swarm. Got: %v\n", i.Name, err)
+						return err
+					}
 				}
-				i, err := p.InstanceNew(session, instanceConf)
+			}
+
+			for _, cmd := range conf.Run {
+				exitCode, err := p.InstanceExec(i, cmd)
 				if err != nil {
-					log.Println(err)
-					return
+					return err
 				}
-				if c.IsSwarmManager || c.IsSwarmWorker {
-					// check if we have connection to the daemon, if not, create it
-					if i.Docker == nil {
-						dock, err := p.docker.New(i.IP, i.Cert, i.Key)
-						if err != nil {
-							log.Println(err)
-							return
-						}
-						i.Docker = dock
-					}
+				if exitCode != 0 {
+					return fmt.Errorf("Command returned %d on instance %s", exitCode, i.IP)
 				}
-
-				if firstSwarmManager != nil {
-					if c.IsSwarmManager {
-						// this is a swarm manager
-						// cluster has already been initiated, join as manager
-						err := i.Docker.SwarmJoin(fmt.Sprintf("%s:2377", firstSwarmManager.IP), tokens.Manager)
-						if err != nil {
-							log.Println(err)
-							return
-						}
-					}
-					if c.IsSwarmWorker {
-						// this is a swarm worker
-						err := i.Docker.SwarmJoin(fmt.Sprintf("%s:2377", firstSwarmManager.IP), tokens.Worker)
-						if err != nil {
-							log.Println(err)
-							return
-						}
-					}
-				}
-			}(c)
-		}
-	}
-	wg.Wait()
-
-	return nil
-}
-
-// This function should be called any time a session needs to be prepared:
-// 1. Like when it is created
-// 2. When it was loaded from storage
-func (p *pwd) prepareSession(session *types.Session) error {
-	session.Lock()
-	defer session.Unlock()
-
-	if session.IsPrepared() {
-		return nil
+			}
+			return nil
+		})
 	}
 
-	p.scheduleSessionClose(session)
-
-	// Connect PWD daemon to the new network
-	if err := p.connectToNetwork(session); err != nil {
+	if err := g.Wait(); err != nil {
+		log.Println(err)
 		return err
 	}
 
-	// Schedule periodic tasks
-	p.tasks.Schedule(session)
-
-	for _, i := range session.Instances {
-		// wire the session back to the instance
-		i.Session = session
-		go p.InstanceAttachTerminal(i)
-	}
-	session.SetPrepared()
-
-	return nil
-}
-
-func (p *pwd) scheduleSessionClose(s *types.Session) {
-	timeLeft := s.ExpiresAt.Sub(time.Now())
-	s.SetClosingTimer(time.AfterFunc(timeLeft, func() {
-		p.SessionClose(s)
-	}))
-}
-
-func (p *pwd) connectToNetwork(s *types.Session) error {
-	ip, err := p.docker.ConnectNetwork(config.PWDContainerName, s.Id, s.PwdIpAddress)
-	if err != nil {
-		log.Println("ERROR NETWORKING")
-		return err
-	}
-	s.PwdIpAddress = ip
-	log.Printf("Connected %s to network [%s]\n", config.PWDContainerName, s.Id)
 	return nil
 }

@@ -4,27 +4,24 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/docker/distribution/reference"
-	"github.com/docker/docker/api"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/jsonmessage"
-	"github.com/docker/go-connections/tlsconfig"
+	client "docker.io/go-docker"
+	"docker.io/go-docker/api/types"
+	"docker.io/go-docker/api/types/container"
+	"docker.io/go-docker/api/types/network"
+	"docker.io/go-docker/api/types/swarm"
+	"docker.io/go-docker/api/types/volume"
+	"github.com/containerd/containerd/reference"
+	"github.com/play-with-docker/play-with-docker/config"
 )
 
 const (
@@ -34,24 +31,30 @@ const (
 )
 
 type DockerApi interface {
-	CreateNetwork(id string) error
+	GetClient() *client.Client
+	CreateNetwork(id string, opts types.NetworkCreate) error
 	ConnectNetwork(container, network, ip string) (string, error)
+	NetworkInspect(id string) (types.NetworkResource, error)
 	GetDaemonInfo() (types.Info, error)
+	GetDaemonHost() string
 	GetSwarmPorts() ([]string, []uint16, error)
 	GetPorts() ([]uint16, error)
 	GetContainerStats(name string) (io.ReadCloser, error)
 	ContainerResize(name string, rows, cols uint) error
+	ContainerRename(old, new string) error
 	CreateAttachConnection(name string) (net.Conn, error)
 	CopyToContainer(containerName, destination, fileName string, content io.Reader) error
-	DeleteContainer(id string) error
-	CreateContainer(opts CreateContainerOpts) (string, error)
+	DeleteContainer(name string) error
+	CreateContainer(opts CreateContainerOpts) error
+	GetContainerIPs(id string) (map[string]string, error)
 	ExecAttach(instanceName string, command []string, out io.Writer) (int, error)
 	DisconnectNetwork(containerId, networkId string) error
 	DeleteNetwork(id string) error
 	Exec(instanceName string, command []string) (int, error)
-	New(ip string, cert, key []byte) (DockerApi, error)
-	SwarmInit() (*SwarmTokens, error)
+	SwarmInit(advertiseAddr string) (*SwarmTokens, error)
 	SwarmJoin(addr, token string) error
+	ConfigCreate(name string, labels map[string]string, data []byte) error
+	ConfigDelete(name string) error
 }
 
 type SwarmTokens struct {
@@ -63,8 +66,23 @@ type docker struct {
 	c *client.Client
 }
 
-func (d *docker) CreateNetwork(id string) error {
-	opts := types.NetworkCreate{Driver: "overlay", Attachable: true}
+func (d *docker) GetClient() *client.Client {
+	return d.c
+}
+
+func (d *docker) ConfigCreate(name string, labels map[string]string, data []byte) error {
+	config := swarm.ConfigSpec{}
+	config.Name = name
+	config.Labels = labels
+	config.Data = data
+	_, err := d.c.ConfigCreate(context.Background(), config)
+	return err
+}
+func (d *docker) ConfigDelete(name string) error {
+	return d.c.ConfigRemove(context.Background(), name)
+}
+
+func (d *docker) CreateNetwork(id string, opts types.NetworkCreate) error {
 	_, err := d.c.NetworkCreate(context.Background(), id, opts)
 
 	if err != nil {
@@ -103,8 +121,16 @@ func (d *docker) ConnectNetwork(containerId, networkId, ip string) (string, erro
 	return n.IPAddress, nil
 }
 
+func (d *docker) NetworkInspect(id string) (types.NetworkResource, error) {
+	return d.c.NetworkInspect(context.Background(), id, types.NetworkInspectOptions{})
+}
+
 func (d *docker) GetDaemonInfo() (types.Info, error) {
 	return d.c.Info(context.Background())
+}
+
+func (d *docker) GetDaemonHost() string {
+	return d.c.DaemonHost()
 }
 
 func (d *docker) GetSwarmPorts() ([]string, []uint16, error) {
@@ -164,6 +190,10 @@ func (d *docker) ContainerResize(name string, rows, cols uint) error {
 	return d.c.ContainerResize(context.Background(), name, types.ResizeOptions{Height: rows, Width: cols})
 }
 
+func (d *docker) ContainerRename(old, new string) error {
+	return d.c.ContainerRename(context.Background(), old, new)
+}
+
 func (d *docker) CreateAttachConnection(name string) (net.Conn, error) {
 	ctx := context.Background()
 
@@ -192,14 +222,15 @@ func (d *docker) CopyToContainer(containerName, destination, fileName string, co
 	return d.c.CopyToContainer(context.Background(), containerName, destination, r, types.CopyToContainerOptions{AllowOverwriteDirWithFile: true})
 }
 
-func (d *docker) DeleteContainer(id string) error {
-	return d.c.ContainerRemove(context.Background(), id, types.ContainerRemoveOptions{Force: true, RemoveVolumes: true})
+func (d *docker) DeleteContainer(name string) error {
+	err := d.c.ContainerRemove(context.Background(), name, types.ContainerRemoveOptions{Force: true, RemoveVolumes: true})
+	d.c.VolumeRemove(context.Background(), name, true)
+	return err
 }
 
 type CreateContainerOpts struct {
 	Image         string
 	SessionId     string
-	PwdIpAddress  string
 	ContainerName string
 	Hostname      string
 	ServerCert    []byte
@@ -207,14 +238,16 @@ type CreateContainerOpts struct {
 	CACert        []byte
 	Privileged    bool
 	HostFQDN      string
+	Labels        map[string]string
+	Networks      []string
 }
 
-func (d *docker) CreateContainer(opts CreateContainerOpts) (string, error) {
+func (d *docker) CreateContainer(opts CreateContainerOpts) (err error) {
 	// Make sure directories are available for the new instance container
 	containerDir := "/var/run/pwd"
 	containerCertDir := fmt.Sprintf("%s/certs", containerDir)
 
-	env := []string{}
+	env := []string{fmt.Sprintf("SESSION_ID=%s", opts.SessionId)}
 
 	// Write certs to container cert dir
 	if len(opts.ServerCert) > 0 {
@@ -245,6 +278,11 @@ func (d *docker) CreateContainer(opts CreateContainerOpts) (string, error) {
 		h.SecurityOpt = []string{fmt.Sprintf("apparmor=%s", os.Getenv("APPARMOR_PROFILE"))}
 	}
 
+	if os.Getenv("STORAGE_SIZE") != "" {
+		// assing 10GB size FS for each container
+		h.StorageOpt = map[string]string{"size": os.Getenv("STORAGE_SIZE")}
+	}
+
 	var pidsLimit = int64(1000)
 	if envLimit := os.Getenv("MAX_PROCESSES"); envLimit != "" {
 		if i, err := strconv.Atoi(envLimit); err == nil {
@@ -252,13 +290,19 @@ func (d *docker) CreateContainer(opts CreateContainerOpts) (string, error) {
 		}
 	}
 	h.Resources.PidsLimit = pidsLimit
-	h.Resources.Memory = 4092 * Megabyte
+
+	if memLimit := os.Getenv("MAX_MEMORY_MB"); memLimit != "" {
+		if i, err := strconv.Atoi(memLimit); err == nil {
+			h.Resources.Memory = int64(i) * Megabyte
+		}
+	}
+
 	t := true
 	h.Resources.OomKillDisable = &t
 
-	env = append(env, fmt.Sprintf("PWD_IP_ADDRESS=%s", opts.PwdIpAddress))
 	env = append(env, fmt.Sprintf("PWD_HOST_FQDN=%s", opts.HostFQDN))
-	cf := &container.Config{Hostname: opts.Hostname,
+	cf := &container.Config{
+		Hostname:     opts.Hostname,
 		Image:        opts.Image,
 		Tty:          true,
 		OpenStdin:    true,
@@ -266,54 +310,94 @@ func (d *docker) CreateContainer(opts CreateContainerOpts) (string, error) {
 		AttachStdout: true,
 		AttachStderr: true,
 		Env:          env,
+		Labels:       opts.Labels,
 	}
+
 	networkConf := &network.NetworkingConfig{
-		map[string]*network.EndpointSettings{
-			opts.SessionId: &network.EndpointSettings{Aliases: []string{opts.Hostname}},
-		},
+		EndpointsConfig: map[string]*network.EndpointSettings{opts.Networks[0]: &network.EndpointSettings{}},
 	}
+
+	if config.ExternalDindVolume {
+		_, err = d.c.VolumeCreate(context.Background(), volume.VolumesCreateBody{
+			Driver: "xfsvol",
+			DriverOpts: map[string]string{
+				"size": config.DindVolumeSize,
+			},
+			Name: opts.ContainerName,
+		})
+		if err != nil {
+			return
+		}
+		h.Binds = []string{fmt.Sprintf("%s:/var/lib/docker", opts.ContainerName)}
+
+		defer func() {
+			if err != nil {
+				d.c.VolumeRemove(context.Background(), opts.SessionId, true)
+			}
+		}()
+	}
+
 	container, err := d.c.ContainerCreate(context.Background(), cf, h, networkConf, opts.ContainerName)
 
 	if err != nil {
-		if client.IsErrImageNotFound(err) {
-			log.Printf("Unable to find image '%s' locally\n", opts.Image)
-			if err = d.pullImage(context.Background(), opts.Image); err != nil {
-				return "", err
-			}
-			container, err = d.c.ContainerCreate(context.Background(), cf, h, networkConf, opts.ContainerName)
+		//if client.IsErrImageNotFound(err) {
+		//log.Printf("Unable to find image '%s' locally\n", opts.Image)
+		//if err = d.pullImage(context.Background(), opts.Image); err != nil {
+		//return "", err
+		//}
+		//container, err = d.c.ContainerCreate(context.Background(), cf, h, networkConf, opts.ContainerName)
+		//if err != nil {
+		//return "", err
+		//}
+		//} else {
+		return err
+		//}
+	}
+
+	//connect remaining networks if there are any
+	if len(opts.Networks) > 1 {
+		for _, nid := range opts.Networks {
+			err = d.c.NetworkConnect(context.Background(), nid, container.ID, &network.EndpointSettings{})
 			if err != nil {
-				return "", err
+				return
 			}
-		} else {
-			return "", err
 		}
 	}
 
-	if err := d.copyIfSet(opts.ServerCert, "cert.pem", containerCertDir, opts.ContainerName); err != nil {
-		return "", err
+	if err = d.copyIfSet(opts.ServerCert, "cert.pem", containerCertDir, opts.ContainerName); err != nil {
+		return
 	}
-	if err := d.copyIfSet(opts.ServerKey, "key.pem", containerCertDir, opts.ContainerName); err != nil {
-		return "", err
+	if err = d.copyIfSet(opts.ServerKey, "key.pem", containerCertDir, opts.ContainerName); err != nil {
+		return
 	}
-	if err := d.copyIfSet(opts.CACert, "ca.pem", containerCertDir, opts.ContainerName); err != nil {
-		return "", err
+	if err = d.copyIfSet(opts.CACert, "ca.pem", containerCertDir, opts.ContainerName); err != nil {
+		return
 	}
 
 	err = d.c.ContainerStart(context.Background(), container.ID, types.ContainerStartOptions{})
 	if err != nil {
-		return "", err
+		return
 	}
 
-	cinfo, err := d.c.ContainerInspect(context.Background(), container.ID)
+	return
+}
+
+func (d *docker) GetContainerIPs(id string) (map[string]string, error) {
+	cinfo, err := d.c.ContainerInspect(context.Background(), id)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	return cinfo.NetworkSettings.Networks[opts.SessionId].IPAddress, nil
+	ips := map[string]string{}
+	for networkId, conf := range cinfo.NetworkSettings.Networks {
+		ips[networkId] = conf.IPAddress
+	}
+	return ips, nil
+
 }
 
 func (d *docker) pullImage(ctx context.Context, image string) error {
-	_, err := reference.ParseNormalizedNamed(image)
+	_, err := reference.Parse(image)
 	if err != nil {
 		return err
 	}
@@ -324,14 +408,9 @@ func (d *docker) pullImage(ctx context.Context, image string) error {
 	if err != nil {
 		return err
 	}
-	defer responseBody.Close()
+	_, err = io.Copy(ioutil.Discard, responseBody)
 
-	return jsonmessage.DisplayJSONMessagesStream(
-		responseBody,
-		os.Stderr,
-		os.Stdout.Fd(),
-		false,
-		nil)
+	return err
 }
 
 func (d *docker) copyIfSet(content []byte, fileName, path, containerName string) error {
@@ -411,52 +490,8 @@ func (d *docker) DeleteNetwork(id string) error {
 	return nil
 }
 
-func (d *docker) New(ip string, cert, key []byte) (DockerApi, error) {
-	// We check if the client needs to use TLS
-	var tlsConfig *tls.Config
-	if len(cert) > 0 && len(key) > 0 {
-		tlsConfig = tlsconfig.ClientDefault()
-		tlsConfig.InsecureSkipVerify = true
-		tlsCert, err := tls.X509KeyPair(cert, key)
-		if err != nil {
-			return nil, err
-		}
-		tlsConfig.Certificates = []tls.Certificate{tlsCert}
-	}
-
-	transport := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   1 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext}
-	if tlsConfig != nil {
-		transport.TLSClientConfig = tlsConfig
-	}
-	cli := &http.Client{
-		Transport: transport,
-	}
-	c, err := client.NewClient(fmt.Sprintf("http://%s:2375", ip), api.DefaultVersion, cli, nil)
-	if err != nil {
-		return nil, fmt.Errorf("Could not connect to DinD docker daemon. %s", err)
-	}
-	// try to connect up to 5 times and then give up
-	for i := 0; i < 5; i++ {
-		_, err := c.Ping(context.Background())
-		if err != nil {
-			if client.IsErrConnectionFailed(err) {
-				// connection has failed, maybe instance is not ready yet, sleep and retry
-				log.Printf("Connection to [%s] has failed, maybe instance is not ready yet, sleeping and retrying in 1 second. Try #%d\n", fmt.Sprintf("http://%s:2375", ip), i+1)
-				time.Sleep(time.Second)
-				continue
-			}
-			return nil, err
-		}
-	}
-	return NewDocker(c), nil
-}
-
-func (d *docker) SwarmInit() (*SwarmTokens, error) {
-	req := swarm.InitRequest{AdvertiseAddr: "eth0", ListenAddr: "0.0.0.0:2377"}
+func (d *docker) SwarmInit(advertiseAddr string) (*SwarmTokens, error) {
+	req := swarm.InitRequest{AdvertiseAddr: advertiseAddr, ListenAddr: "0.0.0.0:2377"}
 	_, err := d.c.SwarmInit(context.Background(), req)
 
 	if err != nil {

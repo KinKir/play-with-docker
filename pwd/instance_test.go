@@ -1,83 +1,97 @@
 package pwd
 
 import (
+	"context"
 	"fmt"
-	"sync"
 	"testing"
 	"time"
 
+	dtypes "docker.io/go-docker/api/types"
 	"github.com/play-with-docker/play-with-docker/config"
 	"github.com/play-with-docker/play-with-docker/docker"
+	"github.com/play-with-docker/play-with-docker/event"
+	"github.com/play-with-docker/play-with-docker/id"
+	"github.com/play-with-docker/play-with-docker/provisioner"
 	"github.com/play-with-docker/play-with-docker/pwd/types"
+	"github.com/play-with-docker/play-with-docker/router"
+	"github.com/play-with-docker/play-with-docker/storage"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 )
 
 func TestInstanceResizeTerminal(t *testing.T) {
-	resizedInstanceName := ""
-	resizedRows := uint(0)
-	resizedCols := uint(0)
+	_d := &docker.Mock{}
+	_f := &docker.FactoryMock{}
+	_s := &storage.Mock{}
+	_g := &id.MockGenerator{}
+	_e := &event.Mock{}
+	ipf := provisioner.NewInstanceProvisionerFactory(provisioner.NewWindowsASG(_f, _s), provisioner.NewDinD(_g, _f, _s))
+	sp := provisioner.NewOverlaySessionProvisioner(_f)
 
-	docker := &mockDocker{}
-	docker.containerResize = func(name string, rows, cols uint) error {
-		resizedInstanceName = name
-		resizedRows = rows
-		resizedCols = cols
+	s := &types.Session{Id: "aaaabbbbcccc"}
+	_d.On("ContainerResize", "foobar", uint(24), uint(80)).Return(nil)
+	_s.On("SessionGet", "aaaabbbbcccc").Return(s, nil)
+	_f.On("GetForSession", s).Return(_d, nil)
 
-		return nil
-	}
+	p := NewPWD(_f, _e, _s, sp, ipf)
 
-	tasks := &mockTasks{}
-	broadcast := &mockBroadcast{}
-	storage := &mockStorage{}
-
-	p := NewPWD(docker, tasks, broadcast, storage)
-
-	err := p.InstanceResizeTerminal(&types.Instance{Name: "foobar"}, 24, 80)
-
+	err := p.InstanceResizeTerminal(&types.Instance{Name: "foobar", SessionId: "aaaabbbbcccc"}, 24, 80)
 	assert.Nil(t, err)
-	assert.Equal(t, "foobar", resizedInstanceName)
-	assert.Equal(t, uint(24), resizedRows)
-	assert.Equal(t, uint(80), resizedCols)
+
+	_d.AssertExpectations(t)
+	_f.AssertExpectations(t)
+	_s.AssertExpectations(t)
+	_g.AssertExpectations(t)
+	_e.M.AssertExpectations(t)
 }
 
 func TestInstanceNew(t *testing.T) {
-	containerOpts := docker.CreateContainerOpts{}
-	dock := &mockDocker{}
-	dock.createContainer = func(opts docker.CreateContainerOpts) (string, error) {
-		containerOpts = opts
-		return "10.0.0.1", nil
-	}
+	_d := &docker.Mock{}
+	_f := &docker.FactoryMock{}
+	_s := &storage.Mock{}
+	_g := &id.MockGenerator{}
+	_e := &event.Mock{}
+	ipf := provisioner.NewInstanceProvisionerFactory(provisioner.NewWindowsASG(_f, _s), provisioner.NewDinD(_g, _f, _s))
+	sp := provisioner.NewOverlaySessionProvisioner(_f)
 
-	tasks := &mockTasks{}
-	broadcast := &mockBroadcast{}
-	storage := &mockStorage{}
+	_g.On("NewId").Return("aaaabbbbcccc")
+	_f.On("GetForSession", mock.AnythingOfType("*types.Session")).Return(_d, nil)
+	_d.On("CreateNetwork", "aaaabbbbcccc", dtypes.NetworkCreate{Attachable: true, Driver: "overlay"}).Return(nil)
+	_d.On("GetDaemonHost").Return("localhost")
+	_d.On("ConnectNetwork", config.L2ContainerName, "aaaabbbbcccc", "").Return("10.0.0.1", nil)
+	_s.On("SessionPut", mock.AnythingOfType("*types.Session")).Return(nil)
+	_s.On("SessionCount").Return(1, nil)
+	_s.On("ClientCount").Return(0, nil)
+	_s.On("InstanceCount").Return(0, nil)
+	_s.On("InstanceFindBySessionId", "aaaabbbbcccc").Return([]*types.Instance{}, nil)
 
-	p := NewPWD(dock, tasks, broadcast, storage)
+	var nilArgs []interface{}
+	_e.M.On("Emit", event.SESSION_NEW, "aaaabbbbcccc", nilArgs).Return()
 
-	session, err := p.SessionNew(time.Hour, "", "", "")
+	p := NewPWD(_f, _e, _s, sp, ipf)
+	p.generator = _g
 
-	assert.Nil(t, err)
+	playground := &types.Playground{Id: "foobar", DefaultDinDInstanceImage: "franela/dind"}
 
-	instance, err := p.InstanceNew(session, InstanceConfig{Host: "something.play-with-docker.com"})
+	_s.On("PlaygroundGet", "foobar").Return(playground, nil)
 
+	sConfig := types.SessionConfig{Playground: playground, UserId: "", Duration: time.Hour, Stack: "", StackName: "", ImageName: ""}
+	session, err := p.SessionNew(context.Background(), sConfig)
 	assert.Nil(t, err)
 
 	expectedInstance := types.Instance{
-		Name:         fmt.Sprintf("%s_node1", session.Id[:8]),
-		Hostname:     "node1",
-		IP:           "10.0.0.1",
-		Alias:        "",
-		Image:        config.GetDindImageName(),
-		IsDockerHost: true,
-		Session:      session,
+		Name:        fmt.Sprintf("%s_aaaabbbbcccc", session.Id[:8]),
+		Hostname:    "node1",
+		IP:          "10.0.0.1",
+		RoutableIP:  "10.0.0.1",
+		Image:       "franela/dind",
+		SessionId:   session.Id,
+		SessionHost: session.Host,
+		ProxyHost:   router.EncodeHost(session.Id, "10.0.0.1", router.HostOpts{}),
 	}
-
-	assert.Equal(t, expectedInstance, *instance)
-
 	expectedContainerOpts := docker.CreateContainerOpts{
 		Image:         expectedInstance.Image,
 		SessionId:     session.Id,
-		PwdIpAddress:  session.PwdIpAddress,
 		ContainerName: expectedInstance.Name,
 		Hostname:      expectedInstance.Hostname,
 		ServerCert:    nil,
@@ -85,157 +99,163 @@ func TestInstanceNew(t *testing.T) {
 		CACert:        nil,
 		Privileged:    true,
 		HostFQDN:      "something.play-with-docker.com",
+		Networks:      []string{session.Id},
 	}
-	assert.Equal(t, expectedContainerOpts, containerOpts)
-}
+	_d.On("CreateContainer", expectedContainerOpts).Return(nil)
+	_d.On("GetContainerIPs", expectedInstance.Name).Return(map[string]string{session.Id: "10.0.0.1"}, nil)
+	_s.On("InstancePut", mock.AnythingOfType("*types.Instance")).Return(nil)
+	_e.M.On("Emit", event.INSTANCE_NEW, "aaaabbbbcccc", []interface{}{"aaaabbbb_aaaabbbbcccc", "10.0.0.1", "node1", "ip10-0-0-1-aaaabbbbcccc"}).Return()
 
-func TestInstanceNew_Concurrency(t *testing.T) {
-	i := 0
-	dock := &mockDocker{}
-	dock.createContainer = func(opts docker.CreateContainerOpts) (string, error) {
-		time.Sleep(time.Second)
-		i++
-		return fmt.Sprintf("10.0.0.%d", i), nil
-	}
-
-	tasks := &mockTasks{}
-	broadcast := &mockBroadcast{}
-	storage := &mockStorage{}
-
-	p := NewPWD(dock, tasks, broadcast, storage)
-
-	session, err := p.SessionNew(time.Hour, "", "", "")
-
+	instance, err := p.InstanceNew(session, types.InstanceConfig{PlaygroundFQDN: "something.play-with-docker.com"})
 	assert.Nil(t, err)
 
-	var instance1 *types.Instance
-	var instance2 *types.Instance
+	assert.Equal(t, expectedInstance, *instance)
 
-	wg := sync.WaitGroup{}
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		instance, err := p.InstanceNew(session, InstanceConfig{})
-		assert.Nil(t, err)
-		instance1 = instance
-	}()
-	go func() {
-		defer wg.Done()
-		instance, err := p.InstanceNew(session, InstanceConfig{})
-		assert.Nil(t, err)
-		instance2 = instance
-	}()
-	wg.Wait()
-
-	assert.Subset(t, []string{"node1", "node2"}, []string{instance1.Hostname, instance2.Hostname})
+	_d.AssertExpectations(t)
+	_f.AssertExpectations(t)
+	_s.AssertExpectations(t)
+	_g.AssertExpectations(t)
+	_e.M.AssertExpectations(t)
 }
 
 func TestInstanceNew_WithNotAllowedImage(t *testing.T) {
-	containerOpts := docker.CreateContainerOpts{}
-	dock := &mockDocker{}
-	dock.createContainer = func(opts docker.CreateContainerOpts) (string, error) {
-		containerOpts = opts
-		return "10.0.0.1", nil
-	}
+	_d := &docker.Mock{}
+	_f := &docker.FactoryMock{}
+	_s := &storage.Mock{}
+	_g := &id.MockGenerator{}
+	_e := &event.Mock{}
+	ipf := provisioner.NewInstanceProvisionerFactory(provisioner.NewWindowsASG(_f, _s), provisioner.NewDinD(_g, _f, _s))
+	sp := provisioner.NewOverlaySessionProvisioner(_f)
 
-	tasks := &mockTasks{}
-	broadcast := &mockBroadcast{}
-	storage := &mockStorage{}
+	_g.On("NewId").Return("aaaabbbbcccc")
+	_f.On("GetForSession", mock.AnythingOfType("*types.Session")).Return(_d, nil)
+	_d.On("CreateNetwork", "aaaabbbbcccc", dtypes.NetworkCreate{Attachable: true, Driver: "overlay"}).Return(nil)
+	_d.On("GetDaemonHost").Return("localhost")
+	_d.On("ConnectNetwork", config.L2ContainerName, "aaaabbbbcccc", "").Return("10.0.0.1", nil)
+	_s.On("SessionPut", mock.AnythingOfType("*types.Session")).Return(nil)
+	_s.On("SessionCount").Return(1, nil)
+	_s.On("ClientCount").Return(0, nil)
+	_s.On("InstanceCount").Return(0, nil)
+	_s.On("InstanceFindBySessionId", "aaaabbbbcccc").Return([]*types.Instance{}, nil)
 
-	p := NewPWD(dock, tasks, broadcast, storage)
+	var nilArgs []interface{}
+	_e.M.On("Emit", event.SESSION_NEW, "aaaabbbbcccc", nilArgs).Return()
 
-	session, err := p.SessionNew(time.Hour, "", "", "")
+	p := NewPWD(_f, _e, _s, sp, ipf)
+	p.generator = _g
 
-	assert.Nil(t, err)
-
-	instance, err := p.InstanceNew(session, InstanceConfig{ImageName: "redis"})
+	playground := &types.Playground{Id: "foobar"}
+	sConfig := types.SessionConfig{Playground: playground, UserId: "", Duration: time.Hour, Stack: "", StackName: "", ImageName: ""}
+	session, err := p.SessionNew(context.Background(), sConfig)
 
 	assert.Nil(t, err)
 
 	expectedInstance := types.Instance{
-		Name:         fmt.Sprintf("%s_node1", session.Id[:8]),
-		Hostname:     "node1",
-		IP:           "10.0.0.1",
-		Alias:        "",
-		Image:        "redis",
-		IsDockerHost: false,
-		Session:      session,
+		Name:        fmt.Sprintf("%s_aaaabbbbcccc", session.Id[:8]),
+		Hostname:    "node1",
+		IP:          "10.0.0.1",
+		RoutableIP:  "10.0.0.1",
+		Image:       "redis",
+		SessionId:   session.Id,
+		SessionHost: session.Host,
+		ProxyHost:   router.EncodeHost(session.Id, "10.0.0.1", router.HostOpts{}),
 	}
-
-	assert.Equal(t, expectedInstance, *instance)
-
 	expectedContainerOpts := docker.CreateContainerOpts{
 		Image:         expectedInstance.Image,
 		SessionId:     session.Id,
-		PwdIpAddress:  session.PwdIpAddress,
 		ContainerName: expectedInstance.Name,
 		Hostname:      expectedInstance.Hostname,
 		ServerCert:    nil,
 		ServerKey:     nil,
 		CACert:        nil,
-		Privileged:    false,
+		Privileged:    true,
+		Networks:      []string{session.Id},
 	}
-	assert.Equal(t, expectedContainerOpts, containerOpts)
+	_d.On("CreateContainer", expectedContainerOpts).Return(nil)
+	_d.On("GetContainerIPs", expectedInstance.Name).Return(map[string]string{session.Id: "10.0.0.1"}, nil)
+	_s.On("InstancePut", mock.AnythingOfType("*types.Instance")).Return(nil)
+	_e.M.On("Emit", event.INSTANCE_NEW, "aaaabbbbcccc", []interface{}{"aaaabbbb_aaaabbbbcccc", "10.0.0.1", "node1", "ip10-0-0-1-aaaabbbbcccc"}).Return()
+
+	instance, err := p.InstanceNew(session, types.InstanceConfig{ImageName: "redis"})
+	assert.Nil(t, err)
+
+	assert.Equal(t, expectedInstance, *instance)
+
+	_d.AssertExpectations(t)
+	_f.AssertExpectations(t)
+	_s.AssertExpectations(t)
+	_g.AssertExpectations(t)
+	_e.M.AssertExpectations(t)
 }
 
 func TestInstanceNew_WithCustomHostname(t *testing.T) {
-	containerOpts := docker.CreateContainerOpts{}
-	dock := &mockDocker{}
-	dock.createContainer = func(opts docker.CreateContainerOpts) (string, error) {
-		containerOpts = opts
-		return "10.0.0.1", nil
-	}
+	_d := &docker.Mock{}
+	_f := &docker.FactoryMock{}
+	_s := &storage.Mock{}
+	_g := &id.MockGenerator{}
+	_e := &event.Mock{}
 
-	tasks := &mockTasks{}
-	broadcast := &mockBroadcast{}
-	storage := &mockStorage{}
+	ipf := provisioner.NewInstanceProvisionerFactory(provisioner.NewWindowsASG(_f, _s), provisioner.NewDinD(_g, _f, _s))
+	sp := provisioner.NewOverlaySessionProvisioner(_f)
 
-	p := NewPWD(dock, tasks, broadcast, storage)
+	_g.On("NewId").Return("aaaabbbbcccc")
+	_f.On("GetForSession", mock.AnythingOfType("*types.Session")).Return(_d, nil)
+	_d.On("CreateNetwork", "aaaabbbbcccc", dtypes.NetworkCreate{Attachable: true, Driver: "overlay"}).Return(nil)
+	_d.On("GetDaemonHost").Return("localhost")
+	_d.On("ConnectNetwork", config.L2ContainerName, "aaaabbbbcccc", "").Return("10.0.0.1", nil)
+	_s.On("SessionPut", mock.AnythingOfType("*types.Session")).Return(nil)
+	_s.On("SessionCount").Return(1, nil)
+	_s.On("ClientCount").Return(0, nil)
+	_s.On("InstanceCount").Return(0, nil)
+	_s.On("InstanceFindBySessionId", "aaaabbbbcccc").Return([]*types.Instance{}, nil)
 
-	session, err := p.SessionNew(time.Hour, "", "", "")
+	var nilArgs []interface{}
+	_e.M.On("Emit", event.SESSION_NEW, "aaaabbbbcccc", nilArgs).Return()
 
-	assert.Nil(t, err)
+	p := NewPWD(_f, _e, _s, sp, ipf)
+	p.generator = _g
 
-	instance, err := p.InstanceNew(session, InstanceConfig{ImageName: "redis", Hostname: "redis-master"})
-
+	playground := &types.Playground{Id: "foobar"}
+	sConfig := types.SessionConfig{Playground: playground, UserId: "", Duration: time.Hour, Stack: "", StackName: "", ImageName: ""}
+	session, err := p.SessionNew(context.Background(), sConfig)
 	assert.Nil(t, err)
 
 	expectedInstance := types.Instance{
-		Name:         fmt.Sprintf("%s_redis-master", session.Id[:8]),
-		Hostname:     "redis-master",
-		IP:           "10.0.0.1",
-		Alias:        "",
-		Image:        "redis",
-		IsDockerHost: false,
-		Session:      session,
+		Name:        fmt.Sprintf("%s_aaaabbbbcccc", session.Id[:8]),
+		Hostname:    "redis-master",
+		IP:          "10.0.0.1",
+		RoutableIP:  "10.0.0.1",
+		Image:       "redis",
+		SessionHost: session.Host,
+		SessionId:   session.Id,
+		ProxyHost:   router.EncodeHost(session.Id, "10.0.0.1", router.HostOpts{}),
 	}
-
-	assert.Equal(t, expectedInstance, *instance)
-
 	expectedContainerOpts := docker.CreateContainerOpts{
 		Image:         expectedInstance.Image,
 		SessionId:     session.Id,
-		PwdIpAddress:  session.PwdIpAddress,
 		ContainerName: expectedInstance.Name,
 		Hostname:      expectedInstance.Hostname,
 		ServerCert:    nil,
 		ServerKey:     nil,
 		CACert:        nil,
-		Privileged:    false,
+		Privileged:    true,
+		Networks:      []string{session.Id},
 	}
-	assert.Equal(t, expectedContainerOpts, containerOpts)
-}
 
-func TestInstanceAllowedImages(t *testing.T) {
-	dock := &mockDocker{}
-	tasks := &mockTasks{}
-	broadcast := &mockBroadcast{}
-	storage := &mockStorage{}
+	_d.On("CreateContainer", expectedContainerOpts).Return(nil)
+	_d.On("GetContainerIPs", expectedInstance.Name).Return(map[string]string{session.Id: "10.0.0.1"}, nil)
+	_s.On("InstancePut", mock.AnythingOfType("*types.Instance")).Return(nil)
+	_e.M.On("Emit", event.INSTANCE_NEW, "aaaabbbbcccc", []interface{}{"aaaabbbb_aaaabbbbcccc", "10.0.0.1", "redis-master", "ip10-0-0-1-aaaabbbbcccc"}).Return()
 
-	p := NewPWD(dock, tasks, broadcast, storage)
+	instance, err := p.InstanceNew(session, types.InstanceConfig{ImageName: "redis", Hostname: "redis-master"})
 
-	expectedImages := []string{config.GetDindImageName(), "franela/dind:overlay2-dev", "franela/ucp:2.4.1"}
+	assert.Nil(t, err)
 
-	assert.Equal(t, expectedImages, p.InstanceAllowedImages())
+	assert.Equal(t, expectedInstance, *instance)
+
+	_d.AssertExpectations(t)
+	_f.AssertExpectations(t)
+	_s.AssertExpectations(t)
+	_g.AssertExpectations(t)
+	_e.M.AssertExpectations(t)
 }
